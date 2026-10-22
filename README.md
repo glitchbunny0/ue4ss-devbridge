@@ -176,6 +176,13 @@ game files are included.
 file-polled, game-thread design and adds an MCP server; worth a look if you want an agent to drive
 the game directly.
 
+## Plans
+
+Agent support — JSON answers, a budget against runaway Lua, a read-only mode, an MCP server — is
+drafted in [proposal 0001](docs/proposals/0001-agent-support.md). The UE4SS-side piece, letting
+external tools use the Lua Debugger's REPL, is proposed upstream as
+[UE4SS #1471](https://github.com/UE4SS-RE/RE-UE4SS/issues/1471). Feedback welcome in either place.
+
 ## Tests
 
 `./tools/run_tests.sh` — 66 core assertions (serialiser, request ids, persistence, error capture,
