@@ -1,0 +1,20 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lua 5.4
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
+      - name: Off-game suite + uedev syntax check
+        run: ./tools/run_tests.sh
+      - name: uedev without settings refuses cleanly
+        run: |
+          out="$(UEDEV_CONFIG=/nonexistent ./bin/uedev status 2>&1)" && exit 1
+          grep -q 'UEDEV_HOST is not set' <<<"$out"
+          UEDEV_CONFIG=/nonexistent ./bin/uedev help | grep -q 'uedev swap DIR'
