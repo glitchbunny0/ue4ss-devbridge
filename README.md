@@ -1,12 +1,20 @@
 # ue4ss-devbridge
 
-A development-only REPL into a running UE4SS game, driven from another machine over SSH.
+A development-only REPL into a running UE4SS game.
 
 `DevBridge` is a tiny UE4SS Lua mod that polls `Mods/DevBridge/io/req.lua` every 100 ms on the
 **game thread**, runs whatever Lua it finds in a persistent environment, and writes the result to
-`io/<id>.out`. `bin/uedev` is the client: it ships the request over SSH, waits for the answer and
-prints it, and also tails the UE4SS log, pushes mod folders, takes screenshots and runs remote
-PowerShell.
+`io/<id>.out`. That folder is the whole interface: anything that can put a file there can drive
+the game (see [The protocol](#the-protocol)). `bin/uedev` is a ready-made client for it that also
+reads and follows the UE4SS log, pushes mod folders, hot-swaps shell-based mods and takes
+screenshots.
+
+How `uedev` reaches the game's `ue4ss` folder is a separate, swappable **transport**:
+
+- `local` (default) — the folder is a path on this machine: a Linux/Proton install, a Steam Deck,
+  Windows seen from WSL (`/mnt/c/...`), or any mounted share. Plain file operations.
+- `ssh` — the game runs on another, Windows machine; each operation becomes a PowerShell script
+  sent over SSH. Kept apart in `lib/uedev/ssh.sh`, documented in [docs/ssh.md](docs/ssh.md).
 
 Developed against a UE 5.6 game with UE4SS v3.0.1 (experimental build 1181). The bridge and the
 client are game-agnostic; the scripts in `examples/` are written for *RV There Yet?* and show the
@@ -16,10 +24,9 @@ patterns.
 
 ## Requirements
 
-- **Game box:** Windows, UE4SS installed for the game, an OpenSSH server you can log into with a
-  key (`BatchMode`, no password prompts), and the built-in Windows PowerShell.
-- **Client:** Linux with bash, `ssh`/`scp`, `tar`, `iconv` and GNU coreutils (`base64 -w0`,
-  `date +%N`). `ffmpeg` is optional; `uedev shot` uses it to scale screenshots.
+- **Game:** UE4SS installed for it. The bridge is a plain UE4SS Lua mod.
+- **uedev:** bash, GNU coreutils, `tar`, and `pgrep` for detecting the game process. `ffmpeg` is
+  optional; `uedev shot` uses it to scale screenshots. The ssh transport adds its own list.
 - **Tests:** Lua 5.4; `tools/run_tests.sh` builds one into `$TMPDIR` if none is installed.
 
 ## Configure
@@ -27,15 +34,15 @@ patterns.
 ```sh
 mkdir -p ~/.config/uedev
 cat > ~/.config/uedev/config <<'EOF'
-UEDEV_HOST=player@192.168.1.20
-UEDEV_UE4SS="C:\Program Files (x86)\Steam\steamapps\common\<Game>\<Project>\Binaries\Win64\ue4ss"
+UEDEV_UE4SS="/path/to/steamapps/common/<Game>/<Project>/Binaries/Win64/ue4ss"
 EOF
 ```
 
 The file holds `KEY=value` lines and is parsed, never executed; environment variables of the same
 name win. The game's process name and its screenshot folder are worked out from the
-`*-Shipping.exe` beside the `ue4ss` folder; `UEDEV_PROCESS` and `UEDEV_SHOTS` override them.
-`uedev help` lists every setting.
+`*-Shipping.exe` beside the `ue4ss` folder (on Proton, the screenshot folder is found inside the
+game's prefix); `UEDEV_PROCESS` and `UEDEV_SHOTS` override them. `uedev help` lists every setting.
+For a game on a remote Windows machine, see [docs/ssh.md](docs/ssh.md).
 
 ## Install
 
@@ -102,6 +109,27 @@ loop. A mod that does not speak this protocol leaves the request unanswered and 
 TIMEOUT. The protocol has been exercised against a shell's off-game test suite and the shell has
 loaded in a live game, but a live swap has not been verified yet — hence experimental.
 
+## The protocol
+
+Everything is a file under the game's `ue4ss` folder, so any language, tool or sync mechanism can
+drive the bridge. Write every file atomically: write a temporary file in the same folder, then
+rename it into place. The bridge does the same for its answers.
+
+| What | You write | The game answers |
+|---|---|---|
+| Run Lua | `Mods/DevBridge/io/req.lua`: first line `--@id <id>` (`[A-Za-z0-9_.-]`), then the chunk | `Mods/DevBridge/io/<id>.out` within ~100 ms: captured `print` lines, one `=> value` per returned value, then `OK`; or `ERROR: <traceback>`, `COMPILE ERROR: ...`, or `DISARMED: ...`. Delete it after reading. |
+| Arm / disarm | create / delete `Mods/DevBridge/io/ARMED` | — |
+| Hot swap | `Mods/<Mod>/hotswap/req` holding an id (create the folder) | `Mods/<Mod>/hotswap/<id>.out`: `OK ...` or `REFUSED: ...` |
+| Logs | — | `UE4SS.log`, the bridge's lines prefixed `[DevBridge]` |
+
+The bridge takes `req.lua` and deletes it, so there is one request slot: keep one request in
+flight per bridge. Answers over 256 KB are truncated.
+
+`uedev` speaks this protocol through a transport: a file in `lib/uedev/` that defines the `t_*`
+functions listed in `bin/uedev`, selected with `UEDEV_TRANSPORT=<name>`. `lib/uedev/local.sh` is
+the reference, and `tests/test_uedev_local.sh` runs it end to end against the real bridge in a
+fake game.
+
 ## Limits
 
 - **Kill switch:** requests run only while `io/ARMED` exists (`uedev arm` / `uedev disarm`);
@@ -122,17 +150,17 @@ loaded in a live game, but a live swap has not been verified yet — hence exper
 - UE4SS's `require` caches compiled modules itself, so clearing `package.loaded` does not reload
   code. To patch the bridge live after `uedev push`, `dofile` the module and copy its fields into
   the table `main.lua` captured (`debug.getupvalue(print, i)` named `M`).
+- The local transport is tested on Linux (CI runs it against the real bridge in a fake game); on
+  Windows itself it needs a bash such as WSL or Git Bash, which has not been tried.
 
 ## Security model
 
-- The bridge opens no port. The only way in is the SSH login `uedev` uses, so keep that
-  key-only and reachable from your own network only.
+- The bridge opens no port and listens to nothing but its own folder: whoever can write
+  `Mods/DevBridge/io/` can run code in the game — the same trust as `Mods/` itself, which loads
+  any mod placed there at the next start. Reaching that folder from elsewhere is the transport's
+  job, and its security is the transport's (SSH: see [docs/ssh.md](docs/ssh.md)).
 - `ARMED` is a guard against accidents (a stale request, a forgotten session), not a security
-  boundary: anything that can write to `Mods/DevBridge/io/` can also write to `Mods/` and get its
-  code loaded at the next start. Disarm between sessions anyway.
-- Windows OpenSSH runs commands through `cmd.exe` (pipes break, 8191-char command line), so
-  `uedev` sends a fixed `-EncodedCommand` bootstrap and passes every script and payload base64 on
-  stdin; nothing user-supplied is interpolated into the command line.
+  boundary. Disarm between sessions anyway.
 
 ## Examples
 
@@ -151,9 +179,11 @@ the game directly.
 ## Tests
 
 `./tools/run_tests.sh` — 66 core assertions (serialiser, request ids, persistence, error capture,
-UE4SS userdata shapes, `find` on a no-match, the `call` guard, snapshot/diff) and 19 end-to-end
-ones driving `main.lua` against a fake UE4SS with real files in a temp `io/` folder, plus a syntax
-check of `uedev`. CI runs the same script on every push.
+UE4SS userdata shapes, `find` on a no-match, the `call` guard, snapshot/diff), 19 driving
+`main.lua` against a fake UE4SS with real files in a temp `io/` folder, and 27 end-to-end ones
+running `uedev` over the local transport against the real bridge inside a fake game process
+(requests, arming, status, log and follow, push, swap and its timeout, refusals). Syntax checks
+cover every script. CI runs the same script on every push.
 
 ## License
 

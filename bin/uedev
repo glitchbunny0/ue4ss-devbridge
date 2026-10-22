@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# uedev — drive a UE4SS game on a Windows box over SSH: run Lua live through the
-# DevBridge mod, read/follow UE4SS.log, push mod folders, run PowerShell.
+# uedev — drive a UE4SS game through the DevBridge mod: run Lua live on the game thread,
+# read/follow UE4SS.log, push mod folders, hot-swap shell-based mods, take screenshots.
+# Everything happens through files in the game's ue4ss folder; a transport decides how
+# uedev reaches that folder:
+#   local   the folder is a path on this machine (Linux/Proton, Steam Deck, WSL, a mounted share)
+#   ssh     a Windows box over SSH + PowerShell (lib/uedev/ssh.sh, docs/ssh.md)
 #
 #   uedev -e 'return find("PlayerController")'             run Lua in the game thread
 #   uedev run file.lua | uedev run -                       ... from a file / stdin
@@ -13,17 +17,17 @@
 #   uedev push DIR                                         copy a mod folder into Mods/ (loads at the next game start)
 #   uedev swap DIR                                         EXPERIMENTAL: push a hot-swap-shell mod and swap its
 #                                                          logic in place, no restart (exit 1 if refused)
-#   uedev ps < script.ps1                                  run PowerShell remotely
+#   uedev ps < script.ps1                                  run PowerShell on the game box (ssh transport)
 #
 # Settings, from the environment or from ~/.config/uedev/config (KEY=value lines; the
 # environment wins; the file is parsed, never executed):
-#   UEDEV_HOST      ssh target of the Windows box, e.g. player@192.168.1.20      (required)
-#   UEDEV_UE4SS     Windows path of the game's ue4ss folder, e.g.
-#                   C:\Program Files (x86)\Steam\steamapps\common\<Game>\<Project>\Binaries\Win64\ue4ss  (required)
-#   UEDEV_PROCESS   game process name; default: the *-Shipping.exe beside ue4ss
-#   UEDEV_SHOTS     screenshot folder; default: %LOCALAPPDATA%\<Project>\Saved\Screenshots\Windows
-#   UEDEV_TIMEOUT   seconds to wait for an answer from the game (default 10)
-#   UEDEV_CONFIG    alternative config file path
+#   UEDEV_UE4SS      the game's ue4ss folder (required): a path here, or the Windows path with ssh
+#   UEDEV_TRANSPORT  local | ssh   (default: ssh when UEDEV_HOST is set, else local)
+#   UEDEV_HOST       ssh target, e.g. player@192.168.1.20 (ssh transport)
+#   UEDEV_PROCESS    game process name; default: the *-Shipping.exe beside ue4ss
+#   UEDEV_SHOTS      screenshot folder; default: <LocalAppData>/<Project>/Saved/Screenshots/Windows
+#   UEDEV_TIMEOUT    seconds to wait for an answer from the game (default 10)
+#   UEDEV_CONFIG     alternative config file path
 set -euo pipefail
 
 CONF="${UEDEV_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/uedev/config}"
@@ -40,95 +44,47 @@ cmd="${1:-help}"; shift || true
 if [[ "$cmd" == help || "$cmd" == -h || "$cmd" == --help ]]; then
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0
 fi
-for k in UEDEV_HOST UEDEV_UE4SS; do
-    [[ -n "${!k:-}" ]] || { echo "uedev: $k is not set (environment or $CONF; see: uedev help)" >&2; exit 2; }
-done
 
-HOST="$UEDEV_HOST"
+if [[ -n "${UEDEV_TRANSPORT:-}" ]]; then TRANSPORT="$UEDEV_TRANSPORT"
+elif [[ -n "${UEDEV_HOST:-}" ]]; then TRANSPORT=ssh
+else TRANSPORT=local; fi
+LIB="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/uedev"
+[[ "$TRANSPORT" =~ ^[a-z0-9_-]+$ && -f "$LIB/$TRANSPORT.sh" ]] \
+    || { echo "uedev: unknown transport '$TRANSPORT' (have: $(cd "$LIB" && ls *.sh | sed 's/\.sh$//' | tr '\n' ' '))" >&2; exit 2; }
+[[ -n "${UEDEV_UE4SS:-}" ]] || { echo "uedev: UEDEV_UE4SS is not set (environment or $CONF; see: uedev help)" >&2; exit 2; }
 UE4SS="$UEDEV_UE4SS"
 TIMEOUT="${UEDEV_TIMEOUT:-10}"
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST")
 
-# PowerShell single-quoted literal of a string.
-psq() { printf "'%s'" "${1//\'/\'\'}"; }
-U="$(psq "$UE4SS")"
+# Shared by the transports.
+STATUS_LINES='UE4SS - v|\] v[0-9][0-9A-Za-z.+-]*( \([^)]*\))? loaded|loaded WITHOUT logic|swapped logic|swap REFUSED'
+HOT_RELOAD_WARNING='UNSAFE once any mod hooks Blueprint functions (hang or crash on reload)'
+SWAP_SILENT_HINT='it is not a hot-swap shell yet (restart the game once to load it), or the game thread is stuck.'
 
-# Prepended to every remote script: $proc (the game's process name) and Get-Game.
-PRELUDE="\$proc = $(psq "${UEDEV_PROCESS:-}")
-if (-not \$proc) {
-  \$exe = Get-ChildItem -File -Filter '*-Shipping.exe' -Path (Split-Path $U), $U -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (\$exe) { \$proc = \$exe.BaseName }
-}
-function Get-Game { if (\$proc) { Get-Process -Name \$proc -ErrorAction SilentlyContinue } }"
+# A transport defines: t_init, t_lua ID REQUEST, t_log N REGEX, t_follow REGEX, t_status,
+# t_arm arm|disarm, t_push DIR, t_swap DIR ID, t_shot_newest, t_fetch PATH DEST, t_ps.
+# shellcheck source=/dev/null
+source "$LIB/$TRANSPORT.sh"
+t_init
 
-# Run a PowerShell script (stdin) remotely. The script travels base64 on stdin;
-# only a fixed bootstrap rides the command line, which cmd.exe caps at 8191 chars.
-ps() {
-    local boot enc
-    boot='$ProgressPreference="SilentlyContinue"; [Console]::OutputEncoding=[Text.Encoding]::UTF8; $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($s))'
-    enc="$(printf '%s' "$boot" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)"
-    { printf '%s\n' "$PRELUDE"; cat; } | base64 -w0 | "${SSH[@]}" "powershell -NoProfile -NonInteractive -EncodedCommand $enc" \
-        2> >(grep -v -E '^#< CLIXML|^<Objs ' >&2) | tr -d '\r'
-}
+new_id() { printf '%s-%s-%s' "$(date +%H%M%S)" "$$" "$RANDOM"; }
 
+# One request: first line `--@id <id>`, then the Lua (see README, "The protocol").
 run_lua() {
-    local src="$1" id b64
-    id="$(date +%H%M%S)-$$-$RANDOM"
-    b64="$(printf -- '--@id %s\n%s' "$id" "$src" | base64 -w0)"
-    ps <<EOF
-\$io = Join-Path $U 'Mods\DevBridge\io'
-if (-not (Test-Path \$io)) { 'NO BRIDGE: ' + \$io + ' does not exist (run: uedev push DevBridge)'; exit 3 }
-\$req = Join-Path \$io 'req.lua'; \$tmp = Join-Path \$io 'req.lua.tmp'; \$out = Join-Path \$io '$id.out'
-[IO.File]::WriteAllBytes(\$tmp, [Convert]::FromBase64String('$b64'))
-Move-Item -Force \$tmp \$req
-\$deadline = (Get-Date).AddSeconds($TIMEOUT)
-while (-not (Test-Path \$out) -and (Get-Date) -lt \$deadline) { Start-Sleep -Milliseconds 40 }
-if (Test-Path \$out) {
-  [Console]::Out.Write([IO.File]::ReadAllText(\$out, [Text.Encoding]::UTF8)); Remove-Item \$out
-} else {
-  Remove-Item \$req -ErrorAction SilentlyContinue
-  \$g = [bool](Get-Game)
-  "TIMEOUT after ${TIMEOUT}s — game running: \$g. Not running, bridge not loaded (check: uedev log 200 DevBridge), or the game thread is stuck."
+    local id; id="$(new_id)"
+    t_lua "$id" "$(printf -- '--@id %s\n%s' "$id" "$1")"
 }
-EOF
-}
+
+need_dir() { [[ -d "$1" ]] || { echo "not a directory: $1" >&2; exit 2; }; }
 
 case "$cmd" in
     -e) [[ $# -ge 1 ]] || { echo "usage: uedev -e 'lua'" >&2; exit 2; }; run_lua "$1" ;;
     run)
         f="${1:--}"
         if [[ "$f" == "-" ]]; then run_lua "$(cat)"; else run_lua "$(cat "$f")"; fi ;;
-    log)
-        n="${1:-40}"; pat="${2:-}"
-        ps <<EOF
-\$l = Join-Path $U 'UE4SS.log'
-\$lines = Get-Content -Encoding UTF8 -Tail $( [[ -n "$pat" ]] && echo 20000 || echo "$n" ) \$l
-$( [[ -n "$pat" ]] && echo "\$lines = @(\$lines | Where-Object { \$_ -match $(psq "$pat") }) | Select-Object -Last $n" )
-\$lines
-EOF
-        ;;
-    follow)
-        pat="${1:-.}"
-        ps <<EOF
-Get-Content -Encoding UTF8 -Tail 0 -Wait (Join-Path $U 'UE4SS.log') | Where-Object { \$_ -match $(psq "$pat") }
-EOF
-        ;;
+    log) t_log "${1:-40}" "${2:-}" ;;
+    follow) t_follow "${1:-.}" ;;
     status)
-        ps <<EOF
-\$p = Get-Game
-if (\$p) { "game: running (\$proc, pid \$(\$p.Id), started \$(\$p.StartTime.ToString('HH:mm:ss')))" }
-elseif (\$proc) { "game: not running (\$proc)" }
-else { 'game: unknown (no *-Shipping.exe beside the ue4ss folder; set UEDEV_PROCESS)' }
-\$l = Join-Path $U 'UE4SS.log'
-if (Test-Path \$l) {
-  "log: \$((Get-Item \$l).LastWriteTime.ToString('HH:mm:ss'))"
-  Get-Content -Encoding UTF8 \$l | Where-Object { \$_ -match 'UE4SS - v|\] v[0-9][0-9A-Za-z.+-]* loaded|loaded WITHOUT logic|swapped logic|swap REFUSED' } | Select-Object -Last 6
-}
-"bridge installed: \$(Test-Path (Join-Path $U 'Mods\DevBridge\enabled.txt'))"
-"armed (io\ARMED): \$(Test-Path (Join-Path $U 'Mods\DevBridge\io\ARMED'))"
-\$hr = (Select-String -Path (Join-Path $U 'UE4SS-settings.ini') -Pattern '^EnableHotReloadSystem\s*=' -ErrorAction SilentlyContinue).Line
-if (\$hr -match '=\s*1') { "hot reload: \$hr  <- UNSAFE once any mod hooks Blueprint functions (hang or crash on reload)" } else { "hot reload: \$hr" }
-EOF
+        t_status
         if ssh_out="$(TIMEOUT=3 run_lua 'local ok, h = pcall(hello); if ok then local i = installed and installed() or { hooks = "?", loops = "?" }; return "hello", h.bridge, h.protocol, i.hooks, i.loops end; return "pong"' 2>&1)" && [[ "$ssh_out" == *"=> "* ]]; then
             if [[ "$ssh_out" == *"=> hello"* ]]; then
                 proto="$(sed -n '3s/^=> //p' <<<"$ssh_out")"
@@ -145,88 +101,39 @@ EOF
     shot)
         # Engine screenshot ("shot" console command), copied back and scaled for viewing.
         out="${1:-${TMPDIR:-/tmp}/uedev-shot-$(date +%H%M%S).jpg}"
-        newest() { ps <<EOF
-\$d = $(psq "${UEDEV_SHOTS:-}")
-if (-not \$d) { \$d = Join-Path \$env:LOCALAPPDATA ((\$proc -replace '-(Win64|WinGDK)-Shipping\$', '') + '\Saved\Screenshots\Windows') }
-\$f = Get-ChildItem -File -Filter *.png \$d -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (\$f) { "\$(\$f.FullName.Replace('\','/'))|\$(\$f.LastWriteTime.Ticks)" }
-EOF
-        }
-        before="$(newest)"
+        before="$(t_shot_newest)"
         run_lua 'local pc = find("PlayerController"); call(StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"), "ExecuteConsoleCommand", pc, "shot", pc); return "ok"' >/dev/null
         now=""
         for _ in $(seq 1 20); do
             sleep 0.5
-            now="$(newest)"
+            now="$(t_shot_newest)"
             [[ -n "$now" && "$now" != "$before" ]] && break
         done
         [[ -n "$now" && "$now" != "$before" ]] || { echo "no new screenshot appeared (set UEDEV_SHOTS if the game saves elsewhere)" >&2; exit 1; }
         sleep 0.5   # let the PNG finish writing
         png="${out%.*}.png"
-        scp -q -o BatchMode=yes "$HOST:${now%%|*}" "$png"
+        t_fetch "${now%%|*}" "$png"
         if command -v ffmpeg >/dev/null; then
             ffmpeg -loglevel error -y -i "$png" -vf scale=1280:-1 "$out" && rm -f "$png" && echo "$out"
         else
             echo "$png"
         fi ;;
-    arm|disarm)
-        ps <<EOF
-\$a = Join-Path $U 'Mods\DevBridge\io\ARMED'
-if ('$cmd' -eq 'arm') { New-Item -ItemType File -Force \$a | Out-Null } else { Remove-Item -Force -ErrorAction SilentlyContinue \$a }
-"armed: \$(Test-Path \$a)"
-EOF
-        ;;
+    arm|disarm) t_arm "$cmd" ;;
     push)
-        d="${1:?usage: uedev push DIR}"; d="${d%/}"; name="$(basename "$d")"
-        [[ -d "$d" ]] || { echo "not a directory: $d" >&2; exit 2; }
-        tar -C "$(dirname "$d")" --exclude="$name/hotswap" -cf - "$name" | base64 -w0 | {
-            payload="$(cat)"
-            ps <<EOF
-\$mods = Join-Path $U 'Mods'
-\$tar = Join-Path \$env:TEMP 'uedev-push.tar'
-[IO.File]::WriteAllBytes(\$tar, [Convert]::FromBase64String('$payload'))
-tar -xf \$tar -C \$mods
-Remove-Item \$tar
-\$n = (Get-ChildItem -Recurse -File (Join-Path \$mods '$name')).Count
-"pushed $name -> \$mods\\$name (\$n files)"
-EOF
-        } ;;
+        d="${1:?usage: uedev push DIR}"; d="${d%/}"; need_dir "$d"
+        t_push "$d" ;;
     swap)
-        # Hot swap for a mod whose main.lua is a hot-swap shell (see README): push the files,
-        # drop Mods/<name>/hotswap/req holding an id, and wait for the shell's answer in
-        # hotswap/<id>.out. The shell re-runs its logic files in the SAME Lua state, so hooks
-        # stay valid; UE4SS's own reload is never involved. One SSH round trip.
-        d="${1:?usage: uedev swap DIR}"; d="${d%/}"; name="$(basename "$d")"
-        [[ -d "$d" ]] || { echo "not a directory: $d" >&2; exit 2; }
-        id="$(date +%H%M%S)-$$-$RANDOM"
+        # Hot swap for a mod whose main.lua is a hot-swap shell (see README): the files land,
+        # then Mods/<name>/hotswap/req holding an id; the shell answers in hotswap/<id>.out.
+        # It re-runs its logic files in the SAME Lua state, so hooks stay valid; UE4SS's own
+        # reload is never involved.
+        d="${1:?usage: uedev swap DIR}"; d="${d%/}"; need_dir "$d"
+        id="$(new_id)"
         t0="$(date +%s%N)"
-        res="$(tar -C "$(dirname "$d")" --exclude="$name/hotswap" -cf - "$name" | base64 -w0 | {
-            payload="$(cat)"
-            ps <<EOF
-\$mods = Join-Path $U 'Mods'
-\$tar = Join-Path \$env:TEMP 'uedev-swap.tar'
-[IO.File]::WriteAllBytes(\$tar, [Convert]::FromBase64String('$payload'))
-tar -xf \$tar -C \$mods
-Remove-Item \$tar
-\$hs = Join-Path \$mods '$name\hotswap'
-New-Item -ItemType Directory -Force \$hs | Out-Null
-\$req = Join-Path \$hs 'req'; \$tmp = Join-Path \$hs 'req.tmp'; \$out = Join-Path \$hs '$id.out'
-[IO.File]::WriteAllBytes(\$tmp, [Text.Encoding]::ASCII.GetBytes('$id'))
-Move-Item -Force \$tmp \$req
-\$deadline = (Get-Date).AddSeconds($TIMEOUT)
-while (-not (Test-Path \$out) -and (Get-Date) -lt \$deadline) { Start-Sleep -Milliseconds 40 }
-if (Test-Path \$out) {
-  [Console]::Out.Write([IO.File]::ReadAllText(\$out, [Text.Encoding]::UTF8)); Remove-Item \$out
-} else {
-  Remove-Item \$req -ErrorAction SilentlyContinue
-  \$g = [bool](Get-Game)
-  "TIMEOUT after ${TIMEOUT}s — game running: \$g. Files are pushed, but the running $name did not answer: it is not a hot-swap shell yet (restart the game once to load it), or the game thread is stuck."
-}
-EOF
-        })"
+        res="$(t_swap "$d" "$id")"
         ms=$(( ($(date +%s%N) - t0) / 1000000 ))
-        printf '%s\n(%s, %d ms round trip)\n' "${res%$'\n'}" "$name" "$ms"
+        printf '%s\n(%s, %d ms round trip)\n' "${res%$'\n'}" "$(basename "$d")" "$ms"
         [[ "$res" == OK* ]] ;;
-    ps) ps ;;
+    ps) t_ps ;;
     *) echo "unknown command: $cmd (try: uedev help)" >&2; exit 2 ;;
 esac

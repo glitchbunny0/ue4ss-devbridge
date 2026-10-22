@@ -14,7 +14,8 @@ if [[ -z "$LUA" ]]; then
     fi
     LUA="$CACHE/src/lua"; LUAC="$CACHE/src/luac"
 fi
-"$LUAC" -p DevBridge/Scripts/*.lua
-bash -n bin/uedev
+"$LUAC" -p DevBridge/Scripts/*.lua tests/fake_game.lua
+bash -n bin/uedev lib/uedev/*.sh tests/test_uedev_local.sh
 "$LUA" tests/test_devbridge.lua
 "$LUA" tests/test_main.lua
+LUA="$LUA" bash tests/test_uedev_local.sh
